@@ -97,7 +97,7 @@ def _run_middleware(headers: list[tuple[bytes, bytes]]) -> dict:
 def test_library_settings_come_from_the_request_and_are_reset():
     seen = _run_middleware(
         [
-            (b"x-purplemcp-base-url", b"https://acme.sentinelone.net/"),
+            (b"x-purplemcp-base-url", b"https://example.sentinelone.net/"),
             (b"x-purplemcp-token", b"ApiToken tok-123"),
             (b"x-virustotal-api-key", b"vt-1"),
         ]
@@ -105,7 +105,7 @@ def test_library_settings_come_from_the_request_and_are_reset():
     library = seen["library"]
     assert library is seen["settings"]
     assert library.graphql_service_token == "tok-123"
-    assert library.sentinelone_console_base_url == "https://acme.sentinelone.net"
+    assert library.sentinelone_console_base_url == "https://example.sentinelone.net"
     assert library.vt_api_key == "vt-1"
     assert current_settings() is None
     with pytest.raises(MissingCredentials):
@@ -134,7 +134,7 @@ def test_concurrent_requests_do_not_share_credentials():
         return {
             "type": "http",
             "path": "/mcp",
-            "headers": [(b"x-purplemcp-base-url", b"https://acme.sentinelone.net"), (b"x-purplemcp-token", token)],
+            "headers": [(b"x-purplemcp-base-url", b"https://example.sentinelone.net"), (b"x-purplemcp-token", token)],
         }
 
     async def both():

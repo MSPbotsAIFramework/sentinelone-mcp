@@ -145,7 +145,7 @@ FetchFields = Annotated[
     Literal["MINIMAL", "STANDARD", "ALL"] | list[str],
     Field(description='MINIMAL (7 fields), STANDARD (13) or ALL (~200), or a list of camelCase field names.'),
 ]
-InventoryLimit = Annotated[int, Field(description="Items to return, 1-1000 (default 50).", ge=1, le=1000)]
+InventoryLimit = Annotated[int, Field(description="Items to return, 1-200 (default 50).", ge=1, le=200)]
 InventorySkip = Annotated[int, Field(description="Items to skip for paging (default 0).", ge=0)]
 Hash = Annotated[str, Field(description="File hash: MD5, SHA-1 or SHA-256.", min_length=32)]
 

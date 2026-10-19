@@ -108,3 +108,9 @@ def test_instructions_budget():
 def test_tool_without_credentials_returns_not_configured():
     content, _ = asyncio.run(create_mcp_server().call_tool("list_alerts", {}))
     assert json.loads(content[0].text)["error"]["code"] == "not_configured"
+
+
+@pytest.mark.parametrize("name", ["list_inventory_items", "search_inventory_items"])
+def test_inventory_limit_capped_at_200(tools, name):
+    schema = tools[name].inputSchema["properties"]["limit"]
+    assert schema["maximum"] == 200 and schema["default"] == 50
