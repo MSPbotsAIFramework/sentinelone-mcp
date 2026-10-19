@@ -1,0 +1,13 @@
+SentinelOne MCP Server
+Copyright 2026 MSPbots.ai
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product depends on purple-mcp (https://github.com/Sentinel-One/purple-mcp),
+Copyright (c) 2025 SentinelOne, Inc., licensed under the MIT License. It is
+installed as a dependency at build time and is not copied into this
+repository; its license applies to that package.
+
+"SentinelOne", "Singularity" and "Purple AI" are trademarks of SentinelOne,
+Inc. This project is an independent integration and is not affiliated with or
+endorsed by SentinelOne.
