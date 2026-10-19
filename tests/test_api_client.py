@@ -102,6 +102,20 @@ async def test_value_errors_become_invalid_argument(monkeypatch):
     assert result["error"] == {"code": "invalid_argument", "message": "filters must be a JSON array", "retryable": False}
 
 
+async def test_slow_calls_stop_within_the_budget(monkeypatch):
+    from sentinelone_mcp import tools
+
+    async def slow(**kwargs):
+        await asyncio.sleep(5)
+
+    monkeypatch.setattr(tools, "CALL_BUDGET_SECONDS", 0.05)
+    monkeypatch.setattr(alerts, "search_alerts", slow)
+    result = json.loads(await _call("search_alerts", {}))
+    assert result["error"]["code"] == "upstream_error"
+    assert result["error"]["retryable"] is True
+    assert "narrow" in result["error"]["message"]
+
+
 async def test_out_of_range_page_size_is_rejected_before_the_library():
     with use_settings(TENANT_A):
         with pytest.raises(Exception):

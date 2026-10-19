@@ -18,6 +18,7 @@ concise description, parameter documentation, the standard error envelope and
 the per-request credential check; the API work is done by purple-mcp.
 """
 
+import asyncio
 import inspect
 import logging
 import re
@@ -148,6 +149,10 @@ InventoryLimit = Annotated[int, Field(description="Items to return, 1-1000 (defa
 InventorySkip = Annotated[int, Field(description="Items to skip for paging (default 0).", ge=0)]
 Hash = Annotated[str, Field(description="File hash: MD5, SHA-1 or SHA-256.", min_length=32)]
 
+# Whole-call budget: the gateway times a tool call out at 120s, while purple-mcp
+# allows Purple AI 120s per request and polls PowerQuery results for up to 5 minutes.
+CALL_BUDGET_SECONDS = 100.0
+
 _STATUS = re.compile(r"\b(401|403|404|429|5\d\d)\b")
 
 
@@ -195,9 +200,16 @@ async def _run(name: str, function: Callable[..., Any], needs_console: bool = Tr
     try:
         result = function(**kwargs)
         if inspect.isawaitable(result):
-            result = await result
+            result = await asyncio.wait_for(result, timeout=CALL_BUDGET_SECONDS)
     except MissingCredentials:
         return NOT_CONFIGURED
+    except TimeoutError:
+        logger.info("tool=%s outcome=timeout ms=%d", name, _ms(started))
+        return error_envelope(
+            "upstream_error",
+            f"SentinelOne did not answer within {CALL_BUDGET_SECONDS:.0f} seconds; narrow the time range or query and try again.",
+            True,
+        )
     except ValueError as e:
         logger.info("tool=%s outcome=invalid_argument ms=%d", name, _ms(started))
         return error_envelope("invalid_argument", str(e)[:800], False)
