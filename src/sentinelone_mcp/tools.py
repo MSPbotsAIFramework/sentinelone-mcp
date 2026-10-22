@@ -20,6 +20,7 @@ the per-request credential check; the API work is done by purple-mcp.
 
 import asyncio
 import inspect
+import json
 import logging
 import re
 import time
@@ -30,8 +31,8 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
+from ._json import MAX_CHARS, dump_json_capped, error_envelope
 from ._json import compact as to_json
-from ._json import error_envelope
 from .purple import MissingCredentials, current_settings
 
 # Imported after .purple so the settings bridge is in place first.
@@ -63,7 +64,7 @@ NOT_CONFIGURED = error_envelope(
 # ---- shared parameter documentation -------------------------------------------
 
 First = Annotated[int, Field(description="Records to return, 1-100 (default 10).", ge=1, le=100)]
-After = Annotated[str | None, Field(description="pageInfo.endCursor from the previous page.")]
+After = Annotated[str | None, Field(description="next_after (or pageInfo.endCursor) from the previous page.")]
 HistoryFirst = Annotated[int, Field(description="History events to return, 1-100 (default 10).", ge=1, le=100)]
 FILTER_SHAPE = (
     'JSON string: an array of {"fieldId", "filterType", ...} objects (max 50), ANDed. filterType: '
@@ -146,7 +147,11 @@ FetchFields = Annotated[
     Field(description='MINIMAL (7 fields), STANDARD (13) or ALL (~200), or a list of camelCase field names.'),
 ]
 InventoryLimit = Annotated[int, Field(description="Items to return, 1-200 (default 50).", ge=1, le=200)]
-InventorySkip = Annotated[int, Field(description="Items to skip for paging (default 0).", ge=0)]
+InventorySkip = Annotated[int, Field(description="Items to skip for paging (default 0); pass next_skip.", ge=0)]
+Offset = Annotated[
+    int | None, Field(description="Record position to start from (0-based); pass next_offset from the previous result.", ge=0)
+]
+Limit = Annotated[int | None, Field(description="Records to return (default: as many as fit the response size limit).", ge=1)]
 Hash = Annotated[str, Field(description="File hash: MD5, SHA-1 or SHA-256.", min_length=32)]
 
 # Whole-call budget: the gateway times a tool call out at 120s, while purple-mcp
@@ -189,8 +194,17 @@ def _as_json_text(value: Any) -> Any:
     return to_json(value) if isinstance(value, (list, dict)) else value
 
 
-async def _run(name: str, function: Callable[..., Any], needs_console: bool = True, **kwargs: Any) -> str:
-    """Call one purple-mcp tool and always return a string (result or error envelope)."""
+async def _run(
+    name: str,
+    function: Callable[..., Any],
+    needs_console: bool = True,
+    paging: tuple | None = None,
+    **kwargs: Any,
+) -> str:
+    """Call one purple-mcp tool and always return a string (result or error envelope).
+
+    ``paging`` says how a cut list continues: ("cursor",), ("skip", skip) or ("local", offset, limit).
+    """
     for key in ("filters", "fields"):
         if key in kwargs:
             kwargs[key] = _as_json_text(kwargs[key])
@@ -217,9 +231,92 @@ async def _run(name: str, function: Callable[..., Any], needs_console: bool = Tr
         logger.info("tool=%s outcome=error error=%s ms=%d", name, type(e).__name__, _ms(started))
         return _envelope_for(e)
     logger.info("tool=%s outcome=ok ms=%d", name, _ms(started))
-    if isinstance(result, str):
-        return result
-    return to_json(result) if result is not None else to_json({"result": None})
+    return _shape(result, paging)
+
+
+def _shape(result: Any, paging: tuple | None) -> str:
+    """Compact, size-capped JSON (or capped text) for a purple-mcp result.
+
+    purple-mcp returns indented JSON strings; they are parsed so the size limit can cut lists
+    without skipping records. Cursor lists continue from next_after (the cursor of the last record
+    returned), inventory from next_skip, and lists purple-mcp returns whole from next_offset.
+    """
+    data = result
+    if isinstance(result, str) and result.strip()[:1] in ("{", "["):
+        try:
+            data = json.loads(result)
+        except ValueError:
+            data = result
+    if data is None:
+        data = {"result": None}
+    if isinstance(data, str):
+        return _cap_text(data)
+    kind = paging[0] if paging else None
+    if kind == "cursor" and isinstance(data, dict) and isinstance(data.get("edges"), list):
+        info = data.get("pageInfo") if isinstance(data.get("pageInfo"), dict) else {}
+        if info.get("hasNextPage") and info.get("endCursor"):
+            data["next_after"] = info["endCursor"]
+        positions = [e.get("cursor") if isinstance(e, dict) else None for e in data["edges"]]
+        data["_resume"] = {"key": "next_after", "positions": positions}
+    elif kind == "skip" and isinstance(data, dict) and isinstance(data.get("data"), list):
+        start = paging[1] or 0
+        total = (data.get("pagination") or {}).get("totalCount") if isinstance(data.get("pagination"), dict) else None
+        returned = len(data["data"])
+        more = start + returned < total if isinstance(total, int) else returned > 0 and returned >= (paging[2] if len(paging) > 2 else 1)
+        if more:
+            data["next_skip"] = start + returned
+        data["_resume"] = {"key": "next_skip", "start": start}
+    elif kind == "local":
+        data = local_page(data, paging[1], paging[2])
+    text = dump_json_capped(data)
+    if kind == "cursor" and '"truncated":true' in text:
+        payload = json.loads(text)
+        if isinstance(payload.get("pageInfo"), dict):
+            # The nested pageInfo still points past the cut records: make it agree with next_after.
+            payload["pageInfo"] = payload["pageInfo"] | {"hasNextPage": True, "endCursor": payload.get("next_after")}
+            text = to_json(payload)
+    return text
+
+
+def _cap_text(text: str) -> str:
+    """Plain-text results (e.g. Purple AI answers) are shortened past the size limit."""
+    if len(text) <= MAX_CHARS:
+        return text
+    keep = MAX_CHARS - 400
+    return to_json(
+        {
+            "text": text[:keep] + "...[truncated]",
+            "truncated": True,
+            "note": f"The answer was {len(text)} characters; only the first {keep} fit the response size limit. "
+            "Ask a narrower question to see the rest.",
+        }
+    )
+
+
+def local_page(data: Any, offset: int | None, limit: int | None) -> Any:
+    """Slice the biggest list of a result purple-mcp returns whole, adding offset / next_offset."""
+    if isinstance(data, list):
+        key, rest, rows = "items", {}, data
+    elif isinstance(data, dict):
+        lists = [k for k, v in data.items() if isinstance(v, list)]
+        if not lists:
+            return data
+        key = max(lists, key=lambda k: len(data[k]))
+        rest, rows = {k: v for k, v in data.items() if k != key}, data[key]
+    else:
+        return data
+    start = offset or 0
+    shown = rows[start:] if limit is None else rows[start : start + limit]
+    more = start + len(shown) < len(rows)
+    return rest | {
+        key: shown,
+        "count": len(shown),
+        "total": len(rows),
+        "offset": start,
+        "has_more": more,
+        "next_offset": start + len(shown) if more else None,
+        "_resume": {"key": "next_offset", "start": start},
+    }
 
 
 def _ms(started: float) -> int:
@@ -308,7 +405,7 @@ def register(mcp: FastMCP) -> None:  # noqa: C901 - one block per tool keeps the
 
         Returns edges, pageInfo (endCursor for the next page) and totalCount.
         """
-        return await _run("list_alerts", alerts.list_alerts, first=first, after=after, view_type=view_type, fields=fields)
+        return await _run("list_alerts", alerts.list_alerts, paging=("cursor",), first=first, after=after, view_type=view_type, fields=fields)
 
     @mcp.tool(annotations=READ_ONLY)
     async def search_alerts(
@@ -323,7 +420,7 @@ def register(mcp: FastMCP) -> None:  # noqa: C901 - one block per tool keeps the
         For 'how many' questions set first=1 and read totalCount.
         """
         return await _run(
-            "search_alerts", alerts.search_alerts, filters=filters, first=first, after=after, view_type=view_type, fields=fields
+            "search_alerts", alerts.search_alerts, paging=("cursor",), filters=filters, first=first, after=after, view_type=view_type, fields=fields
         )
 
     @mcp.tool(annotations=READ_ONLY)
@@ -336,7 +433,7 @@ def register(mcp: FastMCP) -> None:  # noqa: C901 - one block per tool keeps the
         alert_id: Annotated[str, Field(description="Alert id.")], first: HistoryFirst = 10, after: After = None
     ) -> str:
         """Get an alert's audit trail: status changes, assignments and other events, in order."""
-        return await _run("get_alert_history", alerts.get_alert_history, alert_id=alert_id, first=first, after=after)
+        return await _run("get_alert_history", alerts.get_alert_history, paging=("cursor",), alert_id=alert_id, first=first, after=after)
 
     @mcp.tool(annotations=READ_ONLY)
     async def get_alert_investigation_report(alert_id: Annotated[str, Field(description="Alert id.")]) -> str:
@@ -356,7 +453,7 @@ def register(mcp: FastMCP) -> None:  # noqa: C901 - one block per tool keeps the
     ) -> str:
         """List posture misconfigurations (cloud, Kubernetes, identity, IaC, secrets), newest first."""
         return await _run(
-            "list_misconfigurations", misconfigurations.list_misconfigurations, first=first, after=after, view_type=view_type, fields=fields
+            "list_misconfigurations", misconfigurations.list_misconfigurations, paging=("cursor",), first=first, after=after, view_type=view_type, fields=fields
         )
 
     @mcp.tool(annotations=READ_ONLY)
@@ -370,7 +467,7 @@ def register(mcp: FastMCP) -> None:  # noqa: C901 - one block per tool keeps the
         """Search misconfigurations by severity, status, asset, cloud account, policy, compliance or time."""
         return await _run(
             "search_misconfigurations",
-            misconfigurations.search_misconfigurations,
+            misconfigurations.search_misconfigurations, paging=("cursor",),
             filters=filters,
             first=first,
             after=after,
@@ -394,7 +491,7 @@ def register(mcp: FastMCP) -> None:  # noqa: C901 - one block per tool keeps the
         """Get a misconfiguration's audit trail of status changes and other events."""
         return await _run(
             "get_misconfiguration_history",
-            misconfigurations.get_misconfiguration_history,
+            misconfigurations.get_misconfiguration_history, paging=("cursor",),
             misconfiguration_id=misconfiguration_id,
             first=first,
             after=after,
@@ -410,7 +507,7 @@ def register(mcp: FastMCP) -> None:  # noqa: C901 - one block per tool keeps the
     @mcp.tool(annotations=READ_ONLY)
     async def list_vulnerabilities(first: First = 10, after: After = None, fields: VulnFields = None) -> str:
         """List vulnerabilities found on assets, newest first."""
-        return await _run("list_vulnerabilities", vulnerabilities.list_vulnerabilities, first=first, after=after, fields=fields)
+        return await _run("list_vulnerabilities", vulnerabilities.list_vulnerabilities, paging=("cursor",), first=first, after=after, fields=fields)
 
     @mcp.tool(annotations=READ_ONLY)
     async def search_vulnerabilities(
@@ -418,7 +515,7 @@ def register(mcp: FastMCP) -> None:  # noqa: C901 - one block per tool keeps the
     ) -> str:
         """Search vulnerabilities by severity, CVE, exploitation, KEV, software, fix availability or asset."""
         return await _run(
-            "search_vulnerabilities", vulnerabilities.search_vulnerabilities, filters=filters, first=first, after=after, fields=fields
+            "search_vulnerabilities", vulnerabilities.search_vulnerabilities, paging=("cursor",), filters=filters, first=first, after=after, fields=fields
         )
 
     @mcp.tool(annotations=READ_ONLY)
@@ -435,7 +532,7 @@ def register(mcp: FastMCP) -> None:  # noqa: C901 - one block per tool keeps the
         """Get a vulnerability's audit trail of status changes and other events."""
         return await _run(
             "get_vulnerability_history",
-            vulnerabilities.get_vulnerability_history,
+            vulnerabilities.get_vulnerability_history, paging=("cursor",),
             vulnerability_id=vulnerability_id,
             first=first,
             after=after,
@@ -463,7 +560,7 @@ def register(mcp: FastMCP) -> None:  # noqa: C901 - one block per tool keeps the
     ) -> str:
         """List assets in the unified inventory, optionally for one surface."""
         return await _run(
-            "list_inventory_items", inventory.list_inventory_items, limit=limit, skip=skip, surface=surface, fetch_fields=fetch_fields
+            "list_inventory_items", inventory.list_inventory_items, paging=("skip", skip, limit), limit=limit, skip=skip, surface=surface, fetch_fields=fetch_fields
         )
 
     @mcp.tool(annotations=READ_ONLY)
@@ -483,7 +580,7 @@ def register(mcp: FastMCP) -> None:  # noqa: C901 - one block per tool keeps the
     ) -> str:
         """Search the unified inventory by type, status, OS, name, cloud provider or last activity."""
         return await _run(
-            "search_inventory_items", inventory.search_inventory_items, filters=filters, limit=limit, skip=skip, fetch_fields=fetch_fields
+            "search_inventory_items", inventory.search_inventory_items, paging=("skip", skip, limit), filters=filters, limit=limit, skip=skip, fetch_fields=fetch_fields
         )
 
     # ---- threat intelligence (VirusTotal) -------------------------------------------
@@ -538,9 +635,16 @@ def register(mcp: FastMCP) -> None:  # noqa: C901 - one block per tool keeps the
         query: Annotated[
             str, Field(description="VirusTotal Intelligence query, e.g. 'type:peexe positives:5+ tag:ransomware fs:7d-'.")
         ],
+        offset: Offset = None,
+        limit: Limit = None,
     ) -> str:
-        """Search VirusTotal Intelligence for files matching a query (needs an Intelligence-enabled key)."""
-        return await _run("threat_intel_search", threat_intelligence.threat_intel_search, query=query)
+        """Search VirusTotal Intelligence for files matching a query (needs an Intelligence-enabled key).
+
+        Results come back whole: continue a long list with offset=next_offset.
+        """
+        return await _run(
+            "threat_intel_search", threat_intelligence.threat_intel_search, paging=("local", offset, limit), query=query
+        )
 
     @mcp.tool(annotations=READ_ONLY)
     async def threat_intel_get_file_behavior(
@@ -566,9 +670,17 @@ def register(mcp: FastMCP) -> None:  # noqa: C901 - one block per tool keeps the
     async def cve_search_by_vendor(
         vendor: Annotated[str, Field(description="Vendor name, e.g. apache.")],
         product: Annotated[str | None, Field(description="Product name, e.g. httpd; omit to list the vendor's products.")] = None,
+        offset: Offset = None,
+        limit: Limit = None,
     ) -> str:
-        """List CVEs for a vendor (and product), or the vendor's products when no product is given."""
-        return await _run("cve_search_by_vendor", cve.cve_search_by_vendor, needs_console=False, vendor=vendor, product=product)
+        """List CVEs for a vendor (and product), or the vendor's products when no product is given.
+
+        Results come back whole: continue a long list with offset=next_offset.
+        """
+        return await _run(
+            "cve_search_by_vendor", cve.cve_search_by_vendor, needs_console=False, paging=("local", offset, limit),
+            vendor=vendor, product=product,
+        )
 
     @mcp.tool(annotations=READ_ONLY)
     async def cve_database_status() -> str:

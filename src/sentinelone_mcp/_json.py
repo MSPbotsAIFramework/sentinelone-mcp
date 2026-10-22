@@ -41,7 +41,8 @@ def dump_json_capped(data: Any, max_chars: int = MAX_CHARS) -> str:
        records that were cut. ``retry_page_size`` says how many records fit. A list
        helper whose API accepts any start offset can pass
        ``_resume: {"key": <next field>, "start": <offset of this page>}``; the next
-       offset is then set to just after the last record returned.
+       offset is then set to just after the last record returned. A cursor list
+       passes ``"positions"`` instead (the value to continue from after each record).
 
     ``_resume`` is never part of the output.
     """
@@ -88,8 +89,16 @@ def dump_json_capped(data: Any, max_chars: int = MAX_CHARS) -> str:
                 candidate["truncated"] = True
                 candidate["truncated_field"] = key
                 candidate["retry_page_size"] = max(n, 1)
-                if resume and isinstance(resume.get("start"), int) and resume.get("key"):
-                    candidate[resume["key"]] = resume["start"] + n
+                resume_at = None
+                if resume and resume.get("key"):
+                    positions = resume.get("positions")
+                    if isinstance(positions, list) and 0 < n <= len(positions):
+                        resume_at = positions[n - 1]  # e.g. the cursor of the n-th record
+                    elif isinstance(resume.get("start"), int):
+                        resume_at = resume["start"] + n
+                if resume_at is not None:
+                    candidate[resume["key"]] = resume_at
+                    del candidate["retry_page_size"]  # the continuation field is exact; no retry needed
                     candidate["note"] = (
                         f"Only {n} of {len(items)} records fit the response size limit; "
                         f"continue from {resume['key']}, which starts right after the last record returned."
@@ -145,6 +154,7 @@ _CONTINUATION_KEYS = frozenset(
     {
         "next_page", "next_offset", "next_skip", "next_cursor", "next_page_token", "next_token",
         "starting_after", "next", "next_link", "nextPageAfter", "next_start", "nextPage", "next_page_url",
+        "next_after",
     }
 )
 _RESUME = "_resume"

@@ -45,7 +45,11 @@ GraphQL and REST APIs with the token. A request to `/mcp` without the URL or tok
 ## Tools
 
 All tools return a JSON string and are read-only. Lists page with `first` (1-100) and `after`
-(`pageInfo.endCursor` of the previous page); the inventory pages with `limit` / `skip`.
+(`next_after`, or `pageInfo.endCursor`, of the previous page); the inventory pages with `limit` / `skip`
+(`next_skip`). `threat_intel_search` and `cve_search_by_vendor` come back whole and take `offset` /
+`limit` (`next_offset`). Results are compact JSON kept under 20,000 characters: when a list is cut to fit,
+`next_after` / `next_skip` / `next_offset` start right after the last record returned (and `pageInfo`
+agrees), so following them never skips records; long text answers are shortened with a note.
 `search_*` tools take `filters` as a JSON string or array (see each tool's parameter
 description); datetime filters use epoch milliseconds from `iso_to_unix_timestamp`.
 
@@ -79,10 +83,10 @@ description); datetime filters use epoch milliseconds from `iso_to_unix_timestam
 | `threat_intel_by_domain` | VirusTotal reputation for a domain | **domain** |
 | `threat_intel_by_ip` | VirusTotal reputation for an IP | **ip_address** |
 | `threat_intel_get_file_relationships` | A file's contacted IOCs or related files | **hash_value**, **relationship_type** |
-| `threat_intel_search` | VirusTotal Intelligence search | **query** |
+| `threat_intel_search` | VirusTotal Intelligence search | **query**, offset, limit |
 | `threat_intel_get_file_behavior` | VirusTotal sandbox behaviour for a file | **hash_value**, sandbox |
 | `cve_search_by_id` | One CVE from a public CVE database | **cve_id** |
-| `cve_search_by_vendor` | CVEs for a vendor / product | **vendor**, product |
+| `cve_search_by_vendor` | CVEs for a vendor / product | **vendor**, product, offset, limit |
 | `cve_database_status` | Public CVE database freshness | - |
 
 Errors come back as a JSON envelope instead of an exception:
