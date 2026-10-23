@@ -158,6 +158,9 @@ Hash = Annotated[str, Field(description="File hash: MD5, SHA-1 or SHA-256.", min
 # allows Purple AI 120s per request and polls PowerQuery results for up to 5 minutes.
 CALL_BUDGET_SECONDS = 100.0
 
+_PAGE_INFO_KEYS = ("pageInfo", "page_info")
+VT_MISSING = "Send a VirusTotal API key in the X-Virustotal-Api-Key header to use threat_intel_* tools."
+
 _STATUS = re.compile(r"\b(401|403|404|429|5\d\d)\b")
 
 
@@ -171,22 +174,50 @@ def _chain(error: BaseException) -> list[BaseException]:
     return chain
 
 
+# purple-mcp / GraphQL errors carry no status code; their text says what went wrong.
+_BY_TEXT = (
+    ("unauthorized", re.compile(r"unauthori[sz]ed|forbidden|invalid token|authentication", re.IGNORECASE)),
+    ("not_configured", re.compile(r"PURPLEMCP_VT_API_KEY|virustotal api key|is not enabled|not enabled for", re.IGNORECASE)),
+    (
+        "invalid_argument",
+        re.compile(
+            r"could not be parsed|does not exist or not supported|invalid iso 8601|not a valid|invalid (?:value|filter|argument|input)",
+            re.IGNORECASE,
+        ),
+    ),
+    ("not_found", re.compile(r"required value was null|not found|does not exist", re.IGNORECASE)),
+)
+# Only these can succeed on a retry: timeouts, dropped connections (plus 429 and 5xx above).
+_TRANSIENT = re.compile(
+    r"timed? ?out|timeout|connection (?:reset|refused|aborted|error)|temporarily unavailable|server disconnected",
+    re.IGNORECASE,
+)
+_ISO_HINT = " Use ISO 8601, e.g. 2026-10-22T00:00:00Z."
+
+
 def _envelope_for(error: Exception) -> str:
-    messages = [str(e).strip() or type(e).__name__ for e in _chain(error)]
+    chain = _chain(error)
+    messages = [str(e).strip() or type(e).__name__ for e in chain]
     message = messages[0] if len(messages) == 1 else f"{messages[0]}: {messages[-1]}"
     status = next((m for m in (_STATUS.search(text) for text in reversed(messages)) if m), None)
-    code, retryable = "upstream_error", True
     if status:
-        value = status.group(1)
         code, retryable = {
             "401": ("unauthorized", False),
             "403": ("unauthorized", False),
             "404": ("not_found", False),
             "429": ("rate_limited", True),
-        }.get(value, ("upstream_error", True))
-    elif re.search(r"unauthori[sz]ed|forbidden|invalid token|authentication", message, re.IGNORECASE):
-        code, retryable = "unauthorized", False
-    return error_envelope(code, message[:800], retryable)
+        }.get(status.group(1), ("upstream_error", True))  # 5xx
+        return error_envelope(code, message[:800], retryable)
+    text = " ".join(messages)
+    for code, pattern in _BY_TEXT:
+        if pattern.search(text):
+            if code == "not_configured" and "PURPLEMCP_VT_API_KEY" in text:
+                message = VT_MISSING
+            if code == "invalid_argument" and "iso 8601" in text.lower():
+                message += _ISO_HINT
+            return error_envelope(code, message[:800], False)
+    transient = _TRANSIENT.search(text) or any(isinstance(e, (TimeoutError, ConnectionError)) for e in chain)
+    return error_envelope("upstream_error", message[:800], bool(transient))
 
 
 def _as_json_text(value: Any) -> Any:
@@ -199,6 +230,7 @@ async def _run(
     function: Callable[..., Any],
     needs_console: bool = True,
     paging: tuple | None = None,
+    needs_virustotal: bool = False,
     **kwargs: Any,
 ) -> str:
     """Call one purple-mcp tool and always return a string (result or error envelope).
@@ -210,6 +242,8 @@ async def _run(
             kwargs[key] = _as_json_text(kwargs[key])
     if needs_console and current_settings() is None:
         return NOT_CONFIGURED
+    if needs_virustotal and not getattr(current_settings(), "vt_api_key", None):
+        return error_envelope("not_configured", VT_MISSING, False)
     started = time.monotonic()
     try:
         result = function(**kwargs)
@@ -253,9 +287,13 @@ def _shape(result: Any, paging: tuple | None) -> str:
         return _cap_text(data)
     kind = paging[0] if paging else None
     if kind == "cursor" and isinstance(data, dict) and isinstance(data.get("edges"), list):
-        info = data.get("pageInfo") if isinstance(data.get("pageInfo"), dict) else {}
-        if info.get("hasNextPage") and info.get("endCursor"):
-            data["next_after"] = info["endCursor"]
+        # Alerts come as pageInfo.hasNextPage / endCursor; vulnerabilities and misconfigurations
+        # as page_info.has_next_page / end_cursor (purple-mcp dumps those models without aliases).
+        info = next((data[k] for k in _PAGE_INFO_KEYS if isinstance(data.get(k), dict)), {})
+        more = info.get("hasNextPage", info.get("has_next_page"))
+        cursor = info.get("endCursor", info.get("end_cursor"))
+        if more and cursor:
+            data["next_after"] = cursor
         positions = [e.get("cursor") if isinstance(e, dict) else None for e in data["edges"]]
         data["_resume"] = {"key": "next_after", "positions": positions}
     elif kind == "skip" and isinstance(data, dict) and isinstance(data.get("data"), list):
@@ -271,10 +309,12 @@ def _shape(result: Any, paging: tuple | None) -> str:
     text = dump_json_capped(data)
     if kind == "cursor" and '"truncated":true' in text:
         payload = json.loads(text)
+        # The nested page info still points past the cut records: make it agree with next_after.
         if isinstance(payload.get("pageInfo"), dict):
-            # The nested pageInfo still points past the cut records: make it agree with next_after.
             payload["pageInfo"] = payload["pageInfo"] | {"hasNextPage": True, "endCursor": payload.get("next_after")}
-            text = to_json(payload)
+        if isinstance(payload.get("page_info"), dict):
+            payload["page_info"] = payload["page_info"] | {"has_next_page": True, "end_cursor": payload.get("next_after")}
+        text = to_json(payload)
     return text
 
 
@@ -588,22 +628,22 @@ def register(mcp: FastMCP) -> None:  # noqa: C901 - one block per tool keeps the
     @mcp.tool(annotations=READ_ONLY)
     async def threat_intel_by_hash(hash_value: Hash) -> str:
         """Get VirusTotal intelligence for a file hash: detections, file details, names, signatures, tags."""
-        return await _run("threat_intel_by_hash", threat_intelligence.threat_intel_by_hash, hash_value=hash_value)
+        return await _run("threat_intel_by_hash", threat_intelligence.threat_intel_by_hash, needs_virustotal=True, hash_value=hash_value)
 
     @mcp.tool(annotations=READ_ONLY)
     async def threat_intel_by_url(url: Annotated[str, Field(description="Full URL to look up.")]) -> str:
         """Get VirusTotal reputation for a URL: vendor verdicts, categories, redirects, last analysis."""
-        return await _run("threat_intel_by_url", threat_intelligence.threat_intel_by_url, url=url)
+        return await _run("threat_intel_by_url", threat_intelligence.threat_intel_by_url, needs_virustotal=True, url=url)
 
     @mcp.tool(annotations=READ_ONLY)
     async def threat_intel_by_domain(domain: Annotated[str, Field(description="Domain name, e.g. example.com.")]) -> str:
         """Get VirusTotal reputation for a domain: verdicts, categories, DNS records, WHOIS, certificates."""
-        return await _run("threat_intel_by_domain", threat_intelligence.threat_intel_by_domain, domain=domain)
+        return await _run("threat_intel_by_domain", threat_intelligence.threat_intel_by_domain, needs_virustotal=True, domain=domain)
 
     @mcp.tool(annotations=READ_ONLY)
     async def threat_intel_by_ip(ip_address: Annotated[str, Field(description="IPv4 or IPv6 address.")]) -> str:
         """Get VirusTotal reputation for an IP address: verdicts, owner / ASN, country, related activity."""
-        return await _run("threat_intel_by_ip", threat_intelligence.threat_intel_by_ip, ip_address=ip_address)
+        return await _run("threat_intel_by_ip", threat_intelligence.threat_intel_by_ip, needs_virustotal=True, ip_address=ip_address)
 
     @mcp.tool(annotations=READ_ONLY)
     async def threat_intel_get_file_relationships(
@@ -625,7 +665,7 @@ def register(mcp: FastMCP) -> None:  # noqa: C901 - one block per tool keeps the
         """List a file's VirusTotal relationships: network IOCs it contacted or related / parent files."""
         return await _run(
             "threat_intel_get_file_relationships",
-            threat_intelligence.threat_intel_get_file_relationships,
+            threat_intelligence.threat_intel_get_file_relationships, needs_virustotal=True,
             hash_value=hash_value,
             relationship_type=relationship_type,
         )
@@ -643,7 +683,7 @@ def register(mcp: FastMCP) -> None:  # noqa: C901 - one block per tool keeps the
         Results come back whole: continue a long list with offset=next_offset.
         """
         return await _run(
-            "threat_intel_search", threat_intelligence.threat_intel_search, paging=("local", offset, limit), query=query
+            "threat_intel_search", threat_intelligence.threat_intel_search, needs_virustotal=True, paging=("local", offset, limit), query=query
         )
 
     @mcp.tool(annotations=READ_ONLY)
@@ -654,7 +694,7 @@ def register(mcp: FastMCP) -> None:  # noqa: C901 - one block per tool keeps the
         """Get VirusTotal sandbox behaviour for a file: processes, network, files, registry, MITRE TTPs."""
         return await _run(
             "threat_intel_get_file_behavior",
-            threat_intelligence.threat_intel_get_file_behavior,
+            threat_intelligence.threat_intel_get_file_behavior, needs_virustotal=True,
             hash_value=hash_value,
             sandbox=sandbox,
         )
@@ -664,7 +704,10 @@ def register(mcp: FastMCP) -> None:  # noqa: C901 - one block per tool keeps the
     @mcp.tool(annotations=READ_ONLY)
     async def cve_search_by_id(cve_id: Annotated[str, Field(description="CVE id, e.g. CVE-2024-3094.")]) -> str:
         """Get a CVE from a public CVE database: description, CVSS, affected products, references, CWE."""
-        return await _run("cve_search_by_id", cve.cve_search_by_id, needs_console=False, cve_id=cve_id)
+        result = await _run("cve_search_by_id", cve.cve_search_by_id, needs_console=False, cve_id=cve_id)
+        if result.strip() in ("", "{}", "null", '{"result":null}'):
+            return error_envelope("not_found", f"No CVE {cve_id} in the CVE database.", False)
+        return result
 
     @mcp.tool(annotations=READ_ONLY)
     async def cve_search_by_vendor(
