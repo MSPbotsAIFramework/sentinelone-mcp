@@ -118,8 +118,9 @@ async def test_slow_calls_stop_within_the_budget(monkeypatch):
 
 async def test_out_of_range_page_size_is_rejected_before_the_library():
     with use_settings(TENANT_A):
-        with pytest.raises(Exception):
-            await create_mcp_server().call_tool("list_alerts", {"first": 500})
+        content, _ = await create_mcp_server().call_tool("list_alerts", {"first": 500})
+        error = json.loads(content[0].text)["error"]
+        assert error["code"] == "invalid_argument" and "first" in error["message"]
 
 
 @pytest.mark.parametrize(
