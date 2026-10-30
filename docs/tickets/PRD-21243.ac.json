@@ -1,0 +1,151 @@
+[
+  {
+    "id": "TC-S1-001",
+    "ac": "AC1",
+    "text": "Given valid SentinelOne credentials, when search_agents is called with a hostname fragment that matches a real agent, then the response lists that agent with id, computerName, and networkStatus.",
+    "type": "manual",
+    "steps": [
+      "Set X-Purplemcp-Base-Url / X-Purplemcp-Token to a real SentinelOne console and service-user token",
+      "Call tools/call search_agents with computer_name set to a substring of a known managed endpoint's hostname",
+      "Inspect the returned agents[] array"
+    ],
+    "expect": "agents[] contains at least one entry with non-empty id, computerName and networkStatus fields; response is valid capped JSON, not an error envelope",
+    "result": "blocked",
+    "note": "blocked: no SentinelOne test console available to this pipeline; needs a real vendor account (references/mcp-track.md §3: this does not block 6b/6c)"
+  },
+  {
+    "id": "TC-S1-002",
+    "ac": "AC1",
+    "text": "Given valid credentials, when search_agents is called with a hostname fragment that matches zero agents, then the response is a normal success with an empty agents list, not an error.",
+    "type": "manual",
+    "steps": [
+      "Call search_agents with computer_name set to a string guaranteed not to match any managed endpoint",
+      "Inspect the response"
+    ],
+    "expect": "response is {\"agents\": [], ...} (or equivalent empty-list shape), not an error envelope of any code",
+    "result": "blocked",
+    "note": "blocked: needs a real vendor account"
+  },
+  {
+    "id": "TC-S1-003",
+    "ac": "AC2",
+    "text": "Given a connected, known agent and credentials whose role allows it, when isolate_endpoint is called with that agent's id, then the agent is disconnected from network and the tool returns success with a transitional network_status, and a follow-up search_agents call shows the status changed.",
+    "type": "manual",
+    "steps": [
+      "Pick a test agent known to be connected",
+      "Call isolate_endpoint with its agent_id",
+      "Inspect the immediate response",
+      "Call search_agents (or get by uuid) a short time later and read networkStatus"
+    ],
+    "expect": "immediate response reports network_status in {\"disconnecting\",\"disconnected\"} and affected: 1; the follow-up read shows the agent is no longer \"connected\"",
+    "result": "blocked",
+    "note": "blocked: needs a real vendor account with Agents - Actions permission on the service user"
+  },
+  {
+    "id": "TC-S1-004",
+    "ac": "AC3",
+    "text": "Given a previously isolated agent, when reconnect_endpoint is called with its id, then the agent is reconnected and the tool returns success with a transitional network_status moving back toward connected.",
+    "type": "manual",
+    "steps": [
+      "Using the agent isolated in TC-S1-003, call reconnect_endpoint with its agent_id",
+      "Inspect the response",
+      "Call search_agents a short time later and read networkStatus"
+    ],
+    "expect": "immediate response reports network_status in {\"connecting\",\"connected\"} and affected: 1; the follow-up read shows the agent is no longer \"disconnected\"",
+    "result": "blocked",
+    "note": "blocked: needs a real vendor account with Agents - Actions permission on the service user"
+  },
+  {
+    "id": "TC-S1-005",
+    "ac": "AC4",
+    "text": "Given credentials whose SentinelOne role is viewer-only (no Agents - Actions permission), when isolate_endpoint or reconnect_endpoint is called, then the response is the standard structured unauthorized error envelope, not a stack trace or the raw SentinelOne error body.",
+    "type": "manual",
+    "steps": [
+      "Use a service-user token created with only the current README's viewer-level role",
+      "Call isolate_endpoint against any valid agent_id",
+      "Inspect the response body and HTTP status"
+    ],
+    "expect": "response is {\"error\": {\"code\": \"unauthorized\", \"message\": ..., \"retryable\": false}} (same shape every other tool already returns for a permission failure); no Python traceback, no raw SentinelOne error_response JSON leaked verbatim",
+    "result": "blocked",
+    "note": "blocked: needs a real vendor account plus a second, viewer-only token; this is also the security anchor for OWASP API Top 10 API5 (Broken Function Level Authorization)"
+  },
+  {
+    "id": "TC-S1-006",
+    "ac": "AC5",
+    "text": "Given a syntactically valid but non-existent agent uuid, when isolate_endpoint (or reconnect_endpoint) is called, then the response is a not_found error envelope with affected: 0.",
+    "type": "manual",
+    "steps": [
+      "Generate a random, well-formed UUID that is not a real agent on the console",
+      "Call isolate_endpoint with that uuid as agent_id",
+      "Inspect the response"
+    ],
+    "expect": "response is {\"error\": {\"code\": \"not_found\", ...}} or equivalent affected: 0 shape, not an unhandled exception",
+    "result": "blocked",
+    "note": "blocked: needs a real vendor account"
+  },
+  {
+    "id": "TC-S1-007",
+    "ac": "AC6",
+    "text": "Given a /mcp request missing the required console headers, when any of search_agents, isolate_endpoint or reconnect_endpoint is called, then the response is the same 401 'Missing credentials' behavior GatewayCredentialsMiddleware already returns for every existing tool.",
+    "type": "auto",
+    "tests": [],
+    "note": "automatable without a vendor account: same fixture style as the existing GatewayCredentialsMiddleware tests in tests/test_middleware.py, extended to call the 3 new tool names. tests[] left empty until the dev leg writes them."
+  },
+  {
+    "id": "TC-S1-008",
+    "ac": "AC7",
+    "text": "Given two concurrent /mcp requests carrying two different tenants' console credentials, when both call isolate_endpoint (or search_agents / reconnect_endpoint) at the same time, then neither request's credentials or results are visible to the other.",
+    "type": "auto",
+    "tests": [],
+    "note": "automatable without a real vendor account using two mocked consoles and the same per-request contextvar isolation test pattern already used for the existing tools; this is the security anchor for cross-tenant isolation (OWASP API Top 10 API1-adjacent, BOLA-style). tests[] left empty until the dev leg writes them."
+  },
+  {
+    "id": "TC-S1-009",
+    "ac": "AC8",
+    "text": "Given the README after this ticket's Change list is applied, when a reader opens it, then the Tools table lists search_agents / isolate_endpoint / reconnect_endpoint, the top description no longer claims the server is unconditionally read-only, and the Authentication section states the elevated role isolate/reconnect need.",
+    "type": "manual",
+    "steps": [
+      "Open README.md on the implemented branch",
+      "Check the Tools table for the 3 new rows",
+      "Check the top description (was README.md:6) no longer says 'It is read-only'",
+      "Check the Authentication section documents the Agents - Actions role requirement for the 2 action tools only"
+    ],
+    "expect": "all three checks pass",
+    "result": "untested",
+    "note": "not yet implemented by this design ticket; dev leg applies the Change list, then this becomes checkable without a vendor account"
+  },
+  {
+    "id": "TC-S1-010",
+    "ac": "AC9",
+    "text": "Given the 3 new tools' registration code, when reviewed, then they are registered through the same mcp.tool(...) call used by every existing tool, with nothing special-cased to bypass the MSPbots Connector's per-role per-tool allowlist.",
+    "type": "manual",
+    "steps": [
+      "Read the diff to tools.py register()",
+      "Confirm search_agents / isolate_endpoint / reconnect_endpoint use @mcp.tool(annotations=...) exactly like every existing tool, with no alternate registration path"
+    ],
+    "expect": "no special-cased registration path exists for the 3 new tools",
+    "result": "untested",
+    "note": "code-review-style static check, not a runtime test; confirmed once the dev leg implements the Change list"
+  },
+  {
+    "id": "TC-S1-011",
+    "ac": "AC2",
+    "text": "Given an agent that is already isolated, when isolate_endpoint is called again on the same agent_id, then the call is a no-op (does not error), consistent with the destructiveHint/idempotentHint tool annotation.",
+    "type": "manual",
+    "steps": [
+      "Using an agent already isolated (e.g. from TC-S1-003), call isolate_endpoint again with the same agent_id",
+      "Inspect the response"
+    ],
+    "expect": "response is success (not an error envelope); network_status reflects the agent is already disconnecting/disconnected",
+    "result": "blocked",
+    "note": "blocked: needs a real vendor account"
+  },
+  {
+    "id": "TC-S1-012",
+    "ac": "AC1",
+    "text": "Given a network_status filter value outside the documented enum (connected/disconnecting/disconnected/connecting), when search_agents is called with it, then the response is an invalid_argument error without any HTTP call being made to SentinelOne.",
+    "type": "auto",
+    "tests": [],
+    "note": "automatable without a vendor account: FastMCP/pydantic Literal validation (via EnvelopeFastMCP, see src/sentinelone_mcp/_arguments.py) rejects the argument before agents_api is ever called. tests[] left empty until the dev leg writes them."
+  }
+]
