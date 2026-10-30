@@ -50,3 +50,45 @@ so that part of the new credential-reading code is not a silent-failure risk.
 None beyond the must-fix above — the rest of the diff (credential plumbing reuse, error-envelope
 reuse, tool registration, README/Tools-table/Delivery-notes updates, test coverage for everything
 that doesn't need a live console) matches the technical design and the repo's existing conventions.
+
+### Fixes (round 1) · 9a0342d
+
+1. [must-fix #1 — fixed] `src/sentinelone_mcp/agents_api.py` — added `_send_with_retry`, a bounded
+   retry loop (up to 3 attempts, exponential backoff starting at 0.5s and capped at 8s) wrapping
+   the two outbound calls (`list_agents`'s `client.get`, `_agent_action`'s `client.post`). It
+   retries only on `429` and `5xx` (`_RETRYABLE_STATUSES = {429, 500, 502, 503, 504}`), honors a
+   numeric `Retry-After` header when present (falling back to backoff if it isn't a plain number),
+   and returns any other status — including every other `4xx` — unchanged on the first attempt, so
+   `_fail`'s existing `>=400` → envelope mapping is untouched. `_run_classic`'s existing 100s
+   `asyncio.wait_for` budget (`tools.py:161`, unchanged) already keeps the worst case (3 attempts +
+   backoff) under the SOP §5 120s ceiling, so no new timeout plumbing was needed.
+   **Not reused**: purple-mcp's two tenacity-based retry policies
+   (`graphql_client_base.py:100-104`, `sdl/sdl_query_client.py:86-91`) both retry on
+   `httpx.HTTPError` / any `raise_for_status()` failure, which would also retry non-transient 4xx
+   (403/404) — SOP §5 explicitly says those must not be retried — and neither reads `Retry-After`.
+   Promoting `tenacity` to a direct dependency to force a status-code-only, `Retry-After`-aware
+   policy through it would have added more surface than the ~35-line hand-rolled loop the reviewer
+   offered as the equally-acceptable second option, so that option was taken; `tenacity` stays an
+   indirect dependency (unchanged in `uv.lock`, still resolved at `9.2.1` via `purple-mcp`).
+   Tests added in `tests/test_agents_api.py`: `test_429_then_200_retries_and_succeeds` (and the
+   `503`-via-`list_agents` variant) assert a transient failure is retried and the eventual success
+   is returned to the caller unchanged; `test_retries_are_bounded_then_fails_with_the_last_status`
+   asserts a persistent `503` makes exactly `_MAX_ATTEMPTS` (3) calls and still raises `RuntimeError`
+   with `503` in the message; `test_non_transient_4xx_does_not_retry` asserts a `403` makes exactly
+   one call. The pre-existing `test_server_error_raises_with_status_in_the_message` (a persistent
+   `502`) still passes unchanged in substance — `agents_api.asyncio.sleep` is monkeypatched there
+   (and in the new retry tests) so the added backoff doesn't slow the suite down.
+
+#### Re-run (commit `9a0342d`, synced with `main @ abe07ac` — unmoved since round 1, no merge needed)
+
+| Command | Result |
+|---|---|
+| `uv run pytest -q` | `220 passed, 3 warnings in 31.49s` (216 + 4 new; no new failures, no skips) |
+| `grep -rnP '[\x{4e00}-\x{9fff}]' --exclude-dir=.git --exclude-dir=.venv .` | no output |
+| README "MSPbots Connector" section vs. `vendor-mcp-development/reference/readme-connector-section.md` | unchanged this round, still identical (not touched by this fix) |
+| `gitleaks detect` | not available on this machine (unchanged from round 1); no credentials added or changed in this fix |
+| Manual smoke: `uv run python -m sentinelone_mcp` (placeholder headers, local) | `GET /health` → `{"status":"ok"}`; `tools/list` with no headers → HTTP 401; `tools/list` with placeholder headers → 36 tools incl. `search_agents`/`isolate_endpoint`/`reconnect_endpoint` (same count as round 1, confirms no signature regression); `tools/call search_agents` against the real `placeholder.sentinelone.net` console → reached SentinelOne's API gateway, `HTTP 401` returned immediately (non-retryable, as designed) and mapped to `{"error":{"code":"unauthorized",...}}` — same live-reachability evidence as round 1 |
+
+No test case in `docs/tickets/PRD-21243.ac.json` was touched by this fix (it changes `agents_api.py`'s
+internal transport behavior only, not any tool's inputs/outputs/error mapping); the TC-S1-00x matrix
+and its 7 `blocked`-on-real-account entries from round 1 are unaffected and unchanged.
