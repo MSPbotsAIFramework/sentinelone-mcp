@@ -2,8 +2,9 @@
 
 An [MCP](https://modelcontextprotocol.io) server for [SentinelOne](https://www.sentinelone.com)
 Singularity. It lets an AI agent ask Purple AI hunting questions, run PowerQueries over the
-Singularity Data Lake, and read alerts, vulnerabilities, misconfigurations and the asset
-inventory of one SentinelOne console, plus VirusTotal and public CVE lookups. It is read-only.
+Singularity Data Lake, read alerts, vulnerabilities, misconfigurations and the asset inventory of
+one SentinelOne console (plus VirusTotal and public CVE lookups), and isolate or reconnect a
+managed endpoint.
 
 The tools come from SentinelOne's own open-source tool library,
 [purple-mcp](https://github.com/Sentinel-One/purple-mcp) (MIT), which is installed as a pinned
@@ -104,6 +105,10 @@ Where to get them:
   Service Users) at Account or Site scope with a viewer-level role, and generate its API token.
   The token must cover a single Account or Site; Global-scope tokens are not supported. Purple
   AI and the Data Lake need the matching licences on the account.
+- `search_agents` only needs that same viewer-level role. `isolate_endpoint` and
+  `reconnect_endpoint` need the service user's role to also grant SentinelOne's **Agents -
+  Actions** permission; without it, calls to either tool return the standard `unauthorized`
+  error envelope. Every other tool is unaffected and still only needs the viewer-level role.
 - The console URL is the address you sign in to, e.g. `https://your-console.sentinelone.net`;
   a path after the host name is ignored.
 - A VirusTotal key comes from the VirusTotal profile page; `threat_intel_search` needs a
@@ -116,7 +121,9 @@ GraphQL and REST APIs with the token. A request to `/mcp` without the URL or tok
 
 ## Tools
 
-All tools return a JSON string and are read-only. Lists page with `first` (1-100) and `after`
+All tools return a JSON string. Every tool is read-only except `isolate_endpoint` and
+`reconnect_endpoint`, which change the target agent's network connectivity and need an elevated
+role (see Authentication headers above). Lists page with `first` (1-100) and `after`
 (`next_after`, or `pageInfo.endCursor`, of the previous page); the inventory pages with `limit` / `skip`
 (`next_skip`). `threat_intel_search` and `cve_search_by_vendor` come back whole and take `offset` /
 `limit` (`next_offset`). Results are compact JSON kept under 20,000 characters: when a list is cut to fit,
@@ -160,6 +167,9 @@ description); datetime filters use epoch milliseconds from `iso_to_unix_timestam
 | `cve_search_by_id` | One CVE from a public CVE database | **cve_id** |
 | `cve_search_by_vendor` | CVEs for a vendor / product | **vendor**, product, offset, limit |
 | `cve_database_status` | Public CVE database freshness | - |
+| `search_agents` | Find managed agents by hostname, uuid or network status | computer_name, uuid, network_status, limit, cursor |
+| `isolate_endpoint` | Disconnect one agent from the network (needs Agents - Actions role) | **agent_id** |
+| `reconnect_endpoint` | Reconnect one agent to the network (needs Agents - Actions role) | **agent_id** |
 
 Errors come back as a JSON envelope instead of an exception:
 
@@ -216,16 +226,23 @@ uv run pytest
 
 ## Delivery notes
 
-- **Tool count (33).** Names and parameters are purple-mcp's, kept as an existing contract.
+- **Tool count (36).** 33 are purple-mcp's, names and parameters kept as an existing contract.
+  The 3 agent-action tools (`search_agents`, `isolate_endpoint`, `reconnect_endpoint`, PRD-21243)
+  are this connector's own, calling SentinelOne's classic Management Console API directly.
 - **Built on the vendor's library.** API calls, GraphQL queries and parsing are purple-mcp's,
   pinned to a reviewed commit in `pyproject.toml`; updating it is a one-line change followed
   by the snapshot tests.
 - **Per-request credentials.** purple-mcp looks its settings up through one function; this
   server points that function at the current request's settings, so concurrent tenants never
-  share a token, and no process-wide credentials exist.
+  share a token, and no process-wide credentials exist. The agent-action tools reuse the same
+  per-request settings and the same raw console token -- no new credential field.
 - **Documentation.** Tool descriptions are short; filter syntax, field names and enum values
   are in each parameter's description.
 - **Threat intelligence** needs the optional VirusTotal key; without it those tools say so.
+- **One write/action pair.** `isolate_endpoint` / `reconnect_endpoint` are this connector's first
+  tools that change anything; they share the same per-request credential plumbing as the read
+  tools and add no second authorization layer beyond the Connector's own per-role, per-tool
+  allowlist.
 
 ## License
 

@@ -31,6 +31,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
+from . import agents_api
 from ._json import MAX_CHARS, dump_json_capped, error_envelope
 from ._json import compact as to_json
 from .purple import MissingCredentials, current_settings
@@ -54,6 +55,8 @@ READ_ONLY = ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHin
 # Purple AI answers differ between calls and keep a conversation session.
 READ_ONLY_RUN = ToolAnnotations(readOnlyHint=True, idempotentHint=False, openWorldHint=True)
 LOCAL = ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=False)
+# Calling isolate/reconnect again on an agent already in that state is a no-op, not an error.
+AGENT_ACTION = ToolAnnotations(readOnlyHint=False, idempotentHint=True, destructiveHint=True, openWorldHint=True)
 
 NOT_CONFIGURED = error_envelope(
     "not_configured",
@@ -361,6 +364,38 @@ def local_page(data: Any, offset: int | None, limit: int | None) -> Any:
 
 def _ms(started: float) -> int:
     return int((time.monotonic() - started) * 1000)
+
+
+async def _run_classic(name: str, function: Callable[..., Any], **kwargs: Any) -> str:
+    """Call one agents_api function and always return a string (result or error envelope).
+
+    Mirrors _run's timeout budget, NOT_CONFIGURED short-circuit and _envelope_for error
+    mapping for the classic-API tools. Unlike _run, the called function already returns a
+    plain dict (not a purple-mcp JSON string) and needs none of _shape's cursor/skip/local
+    paging logic -- search_agents forwards the classic API's own cursor as-is.
+    """
+    if current_settings() is None:
+        return NOT_CONFIGURED
+    started = time.monotonic()
+    try:
+        result = await asyncio.wait_for(function(**kwargs), timeout=CALL_BUDGET_SECONDS)
+    except MissingCredentials:
+        return NOT_CONFIGURED
+    except TimeoutError:
+        logger.info("tool=%s outcome=timeout ms=%d", name, _ms(started))
+        return error_envelope(
+            "upstream_error",
+            f"SentinelOne did not answer within {CALL_BUDGET_SECONDS:.0f} seconds; try again.",
+            True,
+        )
+    except ValueError as e:
+        logger.info("tool=%s outcome=invalid_argument ms=%d", name, _ms(started))
+        return error_envelope("invalid_argument", str(e)[:800], False)
+    except Exception as e:  # noqa: BLE001 - tools must never raise
+        logger.info("tool=%s outcome=error error=%s ms=%d", name, type(e).__name__, _ms(started))
+        return _envelope_for(e)
+    logger.info("tool=%s outcome=ok ms=%d", name, _ms(started))
+    return dump_json_capped(result)
 
 
 def register(mcp: FastMCP) -> None:  # noqa: C901 - one block per tool keeps the surface readable
@@ -729,3 +764,56 @@ def register(mcp: FastMCP) -> None:  # noqa: C901 - one block per tool keeps the
     async def cve_database_status() -> str:
         """Show the public CVE database's last update time and size."""
         return await _run("cve_database_status", cve.cve_database_status, needs_console=False)
+
+    # ---- agent actions (classic Management Console API) -----------------------------
+
+    @mcp.tool(annotations=READ_ONLY)
+    async def search_agents(
+        computer_name: Annotated[str | None, Field(description="Hostname substring to match, case-insensitive.")] = None,
+        uuid: Annotated[str | None, Field(description="Exact agent UUID to look up.")] = None,
+        network_status: Annotated[
+            Literal["connected", "disconnecting", "disconnected", "connecting"] | None,
+            Field(description="Only agents currently in this network state."),
+        ] = None,
+        limit: Annotated[int, Field(description="Agents to return, 1-100 (default 10).", ge=1, le=100)] = 10,
+        cursor: Annotated[str | None, Field(description="Pagination cursor from a previous next_cursor.")] = None,
+    ) -> str:
+        """Find SentinelOne-managed agents to get an id for isolate_endpoint / reconnect_endpoint.
+
+        An empty agents list is a normal result, not an error.
+        """
+        return await _run_classic(
+            "search_agents",
+            agents_api.list_agents,
+            computer_name=computer_name,
+            uuid=uuid,
+            network_status=network_status,
+            limit=limit,
+            cursor=cursor,
+        )
+
+    @mcp.tool(annotations=AGENT_ACTION)
+    async def isolate_endpoint(
+        agent_id: Annotated[str, Field(description="Agent id/uuid from search_agents, to disconnect from network.", min_length=1)],
+    ) -> str:
+        """Disconnect one SentinelOne-managed endpoint from the network.
+
+        Needs a service-user role with SentinelOne's Agents - Actions permission (every other
+        tool only needs the viewer-level role). Calling it again on an already-isolated agent is
+        a no-op, not an error. SentinelOne's disconnect is asynchronous: the response reports the
+        transition it triggered (network_status: disconnecting), not a guaranteed final state --
+        call search_agents again to confirm.
+        """
+        return await _run_classic("isolate_endpoint", agents_api.disconnect, agent_id=agent_id)
+
+    @mcp.tool(annotations=AGENT_ACTION)
+    async def reconnect_endpoint(
+        agent_id: Annotated[str, Field(description="Agent id/uuid from search_agents, to reconnect to network.", min_length=1)],
+    ) -> str:
+        """Reconnect a previously isolated SentinelOne-managed endpoint to the network.
+
+        Needs the same Agents - Actions role as isolate_endpoint. Mirrors it: the response
+        reports the transition triggered (network_status: connecting), not a guaranteed final
+        state -- call search_agents again to confirm.
+        """
+        return await _run_classic("reconnect_endpoint", agents_api.connect, agent_id=agent_id)
