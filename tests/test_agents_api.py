@@ -37,6 +37,11 @@ def _json_response(status: int, body: dict):
     return send
 
 
+async def _no_sleep(*args, **kwargs) -> None:
+    """Replaces asyncio.sleep in retry tests so bounded retries run instantly."""
+    return None
+
+
 async def test_list_agents_maps_matches_to_the_documented_shape(monkeypatch):
     body = {
         "data": [
@@ -126,6 +131,8 @@ async def test_permission_denied_raises_with_403_in_the_message(monkeypatch):
 
 
 async def test_server_error_raises_with_status_in_the_message(monkeypatch):
+    # 502 is retryable (SOP §5); patch sleep so the retries in _send_with_retry run instantly.
+    monkeypatch.setattr(agents_api.asyncio, "sleep", _no_sleep)
     monkeypatch.setattr(httpx.AsyncClient, "send", _json_response(502, {"error": "upstream down"}))
     with use_settings(TENANT_A), pytest.raises(RuntimeError, match="502"):
         await agents_api.connect("agent-1")
@@ -138,6 +145,68 @@ async def test_timeout_propagates_for_the_caller_to_classify(monkeypatch):
     monkeypatch.setattr(httpx.AsyncClient, "send", timeout)
     with use_settings(TENANT_A), pytest.raises(httpx.ReadTimeout):
         await agents_api.list_agents()
+
+
+async def test_429_then_200_retries_and_succeeds(monkeypatch):
+    """SOP §5 / PRD-21243 review round 1: bounded retry on 429, honoring Retry-After."""
+    monkeypatch.setattr(agents_api.asyncio, "sleep", _no_sleep)
+    calls: list[httpx.Request] = []
+
+    async def send(self, request, *args, **kwargs):
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(429, headers={"Retry-After": "1"}, json={"data": {}}, request=request)
+        return httpx.Response(200, json={"data": {"affected": 1}}, request=request)
+
+    monkeypatch.setattr(httpx.AsyncClient, "send", send)
+    with use_settings(TENANT_A):
+        result = await agents_api.disconnect("agent-1")
+    assert result == {"agent_id": "agent-1", "network_status": "disconnecting", "affected": 1}
+    assert len(calls) == 2
+
+
+async def test_503_then_200_retries_and_succeeds_for_list(monkeypatch):
+    monkeypatch.setattr(agents_api.asyncio, "sleep", _no_sleep)
+    calls: list[httpx.Request] = []
+
+    async def send(self, request, *args, **kwargs):
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(503, json={"error": "busy"}, request=request)
+        return httpx.Response(200, json={"data": []}, request=request)
+
+    monkeypatch.setattr(httpx.AsyncClient, "send", send)
+    with use_settings(TENANT_A):
+        result = await agents_api.list_agents()
+    assert result == {"agents": []}
+    assert len(calls) == 2
+
+
+async def test_retries_are_bounded_then_fails_with_the_last_status(monkeypatch):
+    monkeypatch.setattr(agents_api.asyncio, "sleep", _no_sleep)
+    calls: list[httpx.Request] = []
+
+    async def send(self, request, *args, **kwargs):
+        calls.append(request)
+        return httpx.Response(503, json={"error": "down"}, request=request)
+
+    monkeypatch.setattr(httpx.AsyncClient, "send", send)
+    with use_settings(TENANT_A), pytest.raises(RuntimeError, match="503"):
+        await agents_api.connect("agent-1")
+    assert len(calls) == agents_api._MAX_ATTEMPTS
+
+
+async def test_non_transient_4xx_does_not_retry(monkeypatch):
+    calls: list[httpx.Request] = []
+
+    async def send(self, request, *args, **kwargs):
+        calls.append(request)
+        return httpx.Response(403, json={"error": "denied"}, request=request)
+
+    monkeypatch.setattr(httpx.AsyncClient, "send", send)
+    with use_settings(TENANT_A), pytest.raises(RuntimeError, match="403"):
+        await agents_api.disconnect("agent-1")
+    assert len(calls) == 1
 
 
 async def test_concurrent_tenants_never_see_each_others_token(monkeypatch):

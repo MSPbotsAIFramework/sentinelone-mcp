@@ -27,6 +27,8 @@ the standard error envelope by status code, so no new error-mapping branch is ne
 there (see Tech design > Change list).
 """
 
+import asyncio
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
@@ -38,6 +40,44 @@ _TIMEOUT = httpx.Timeout(connect=5.0, read=30.0, write=5.0, pool=5.0)
 
 _AGENTS_PATH = "/web/api/v2.1/agents"
 _ACTIONS_PATH = "/web/api/v2.1/agents/actions/{action}"
+
+# SOP §5 (mandatory): bounded retry + exponential backoff for 429/5xx, honoring
+# Retry-After; other 4xx must not be retried. purple-mcp's own tenacity-based
+# retry policies (graphql_client_base.py, sdl_query_client.py) retry on
+# httpx.HTTPError / any raise_for_status() failure -- that would also retry
+# non-transient 4xx like 403/404, which SOP §5 forbids, so they are not reused
+# here. This is a small hand-rolled loop instead (status-code driven, not
+# exception driven), per the review's second option.
+_RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+_MAX_ATTEMPTS = 3  # 1 initial try + up to 2 retries
+_BACKOFF_BASE_SECONDS = 0.5
+_BACKOFF_MAX_SECONDS = 8.0  # keeps worst case well under _run_classic's 100s call budget
+
+
+def _retry_delay_seconds(attempt: int, response: httpx.Response) -> float:
+    """Delay before retry number `attempt` (1-indexed), honoring a numeric Retry-After."""
+    retry_after = response.headers.get("Retry-After")
+    if retry_after is not None:
+        try:
+            return min(float(retry_after), _BACKOFF_MAX_SECONDS)
+        except ValueError:
+            pass  # not a plain number (e.g. an HTTP-date); fall back to backoff
+    return min(_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)), _BACKOFF_MAX_SECONDS)
+
+
+async def _send_with_retry(send: Callable[[], Awaitable[httpx.Response]]) -> httpx.Response:
+    """Send, retrying a bounded number of times on 429/5xx only, honoring Retry-After.
+
+    Any other status (including every other 4xx) is returned as-is on the first
+    attempt -- the caller's existing >=400 check and `_fail` mapping are unchanged.
+    """
+    response = await send()
+    attempt = 1
+    while response.status_code in _RETRYABLE_STATUSES and attempt < _MAX_ATTEMPTS:
+        await asyncio.sleep(_retry_delay_seconds(attempt, response))
+        response = await send()
+        attempt += 1
+    return response
 
 
 def _client() -> httpx.AsyncClient:
@@ -79,7 +119,7 @@ async def list_agents(
     if cursor:
         params["cursor"] = cursor
     async with _client() as client:
-        response = await client.get(_AGENTS_PATH, params=params)
+        response = await _send_with_retry(lambda: client.get(_AGENTS_PATH, params=params))
         if response.status_code >= 400:
             _fail("list", response)
         body = response.json()
@@ -109,9 +149,11 @@ async def _agent_action(action: str, agent_id: str) -> dict[str, Any]:
     when the agent was already in the target state, which is the no-op case AC2 asks for.
     """
     async with _client() as client:
-        response = await client.post(
-            _ACTIONS_PATH.format(action=action),
-            json={"filter": {"ids": [agent_id]}},
+        response = await _send_with_retry(
+            lambda: client.post(
+                _ACTIONS_PATH.format(action=action),
+                json={"filter": {"ids": [agent_id]}},
+            )
         )
         if response.status_code >= 400:
             _fail(action, response)
