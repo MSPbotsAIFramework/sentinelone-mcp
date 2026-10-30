@@ -1,5 +1,7 @@
 # PRD-21243 · Code review
 
+Status: frozen @ 50061de
+
 ## Round 1 · 2026-10-30 · reviewed 338304a (base abe07ac)
 
 Verdict: changes requested
@@ -92,3 +94,69 @@ that doesn't need a live console) matches the technical design and the repo's ex
 No test case in `docs/tickets/PRD-21243.ac.json` was touched by this fix (it changes `agents_api.py`'s
 internal transport behavior only, not any tool's inputs/outputs/error mapping); the TC-S1-00x matrix
 and its 7 `blocked`-on-real-account entries from round 1 are unaffected and unchanged.
+
+## Round 2 · 2026-10-30 · reviewed 50061de (base 338304a)
+
+Verdict: approved
+
+### Scope
+
+`git diff 338304a...50061de -- src/ tests/` (`docs/tickets/PRD-21243-review.md` is the review
+record itself — commits `4e4aba8`, `7852ee2`, `50061de` only touch it and are not re-reviewed as
+code; `7852ee2` translates two quoted SOP fragments that round 1 left in Chinese back into
+English, a docs-only correction, not a code change). Diff is exactly commit `9a0342d`:
+`src/sentinelone_mcp/agents_api.py` (+50/-4) and `tests/test_agents_api.py` (+69). No other file
+changed since round 1 — `README.md` is untouched this round (still byte-identical to
+`vendor-mcp-development/reference/readme-connector-section.md`, confirmed in round 1 and not
+touched by `9a0342d`).
+
+Re-ran independently on `50061de`: `uv run pytest -q` → `220 passed, 3 warnings in 16.28s` (matches
+the self-test re-run reported in the Fixes section below, no new failures, no skips). CJK scan
+(`grep -rnP '[\x{4e00}-\x{9fff}]' --exclude-dir=.git --exclude-dir=.venv .`) → no output, repo-wide
+(not just the diff). Full `abe07ac...50061de` diff stat reviewed to confirm no scope creep since
+round 1: `README.md`, `docs/tickets/PRD-21243.ac.json`, `docs/tickets/PRD-21243.md`,
+`src/sentinelone_mcp/{agents_api.py,server.py,tools.py}`, `tests/{test_agents_api.py,test_tools.py}`
+— unchanged set of files from round 1 plus the round-1 fix, nothing unrelated touched.
+
+### Verification of round 1 must-fix #1 (`agents_api.py:59-61`, bounded retry)
+
+Read `9a0342d` in full, not just the stub's description:
+
+- `_send_with_retry` wraps both outbound calls (`list_agents`'s `client.get` at the call site,
+  `_agent_action`'s `client.post`) behind a `Callable[[], Awaitable[httpx.Response]]`, so the
+  existing `response.status_code >= 400` → `_fail` mapping downstream is untouched — confirmed by
+  reading the full file, not just the diff hunks.
+- Retries only `{429, 500, 502, 503, 504}` (`_RETRYABLE_STATUSES`); any other status, including
+  every other `4xx` (403/404/...), returns on the first attempt — exactly what SOP §5 requires
+  (bounded retry for 429/5xx, no retry for other 4xx). `test_non_transient_4xx_does_not_retry`
+  asserts exactly 1 call on a 403.
+- Bounded at `_MAX_ATTEMPTS = 3` (1 initial + 2 retries), backoff `0.5s * 2^(attempt-1)` capped at
+  `8s` — worst case (2 retries at the cap) is 16s, well inside the SOP §5 / §14 120s-per-call
+  ceiling together with `_run_classic`'s unchanged 100s `asyncio.wait_for` budget
+  (`tools.py:161`, confirmed unchanged in the `abe07ac...50061de` diff — this PR does not touch
+  `tools.py`'s timeout).
+- `Retry-After` is read and honored when it parses as a plain float, capped at the same 8s ceiling
+  so a server-supplied large value cannot blow the call budget; a non-numeric value (e.g. an
+  HTTP-date) falls back to the exponential schedule instead of crashing — reasonable, and covered
+  by the `test_429_then_200_retries_and_succeeds` case (`Retry-After: "1"`).
+- New tests are status-code driven (construct `httpx.Response` directly), not timing-dependent,
+  and monkeypatch `agents_api.asyncio.sleep` so the suite doesn't actually wait out the backoff —
+  ran them: `test_429_then_200_retries_and_succeeds`, `test_503_then_200_retries_and_succeeds_for_list`,
+  `test_retries_are_bounded_then_fails_with_the_last_status`, `test_non_transient_4xx_does_not_retry`
+  all pass as part of the 220.
+- The "not reused: purple-mcp's tenacity policies" rationale in the Fixes section checks out
+  against the actual retry predicates in `graphql_client_base.py` / `sdl_query_client.py`
+  (exception-driven, retries on any `httpx.HTTPError`) — a hand-rolled status-code-driven loop is
+  the correct choice here given SOP §5's "don't retry other 4xx" requirement, not a shortcut.
+
+No new must-fix. The fix matches the technical design's error-envelope convention (nothing in
+`_fail` or `_envelope_for` changed) and does not introduce a new dependency (`tenacity` stays
+indirect, unchanged in `uv.lock`).
+
+### Findings
+
+None.
+
+### Suggestions
+
+None beyond round 1 (already resolved or not applicable).
