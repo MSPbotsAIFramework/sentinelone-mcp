@@ -26,11 +26,12 @@ so that part of the new credential-reading code is not a silent-failure risk.
    goes through `purple-mcp`, which does implement retry/backoff itself — confirmed by reading
    the vendored library: `purple_mcp/libs/graphql_client_base.py`, `purple_mcp/libs/sdl/sdl_query_client.py`
    and others reference retry/backoff, and `tenacity` is in `uv.lock` as a `purple-mcp` dependency).
-   So this gap is new, not inherited. SOP §5 "网络健壮性" is explicitly marked **必须** (mandatory):
-   "有限重试：对 429 和 5xx 做有限次重试 + 指数 backoff，并尊重 Retry-After；对其它 4xx 不重试" — and
-   the §14 Checklist item "对 429 / 5xx 有限重试 + backoff，尊重 Retry-After，单次调用总耗时 < 120s"
-   is one of the explicit must-fix categories for this track (`mcp-track.md` §4.3: "SOP §14
-   Checklist"). Concretely, a transient SentinelOne 5xx or a 429 while calling `isolate_endpoint`
+   So this gap is new, not inherited. SOP §5 ("Network robustness") is explicitly marked
+   mandatory: limited retry with exponential backoff is required for `429` and `5xx` responses,
+   `Retry-After` must be honored, and other `4xx` responses must not be retried. The §14
+   Checklist item covering the same requirement (bounded retry + backoff for `429`/`5xx`,
+   honor `Retry-After`, total call time under 120s including retries) is one of the explicit
+   must-fix categories for this track (`mcp-track.md` §4.3: "SOP §14 Checklist"). Concretely, a transient SentinelOne 5xx or a 429 while calling `isolate_endpoint`
    during an active incident — the exact scenario this tool exists for — fails outright today
    instead of retrying a bounded number of times; the error is correctly labelled `retryable: true`
    by the existing `_envelope_for` status-code mapping (unchanged, reused as designed), but nothing
