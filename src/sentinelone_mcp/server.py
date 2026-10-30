@@ -41,8 +41,9 @@ _BEARER = re.compile(r"^(bearer|apitoken)\s+", re.IGNORECASE)
 request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("sentinelone_request_id", default="-")
 
 INSTRUCTIONS = (
-    "SentinelOne Singularity protects endpoints, cloud and identity. These "
-    "tools read one SentinelOne console; none of them change anything.\n"
+    "SentinelOne Singularity protects endpoints, cloud and identity. Most of these "
+    "tools read one SentinelOne console; search_agents, isolate_endpoint and "
+    "reconnect_endpoint act on it and need an elevated service-user role.\n"
     "Usage:\n"
     "- Hunting: ask purple_ai in plain language (it writes PowerQueries), then "
     "run the returned query with powerquery over a window from "
@@ -52,6 +53,8 @@ INSTRUCTIONS = (
     "- Exposure: list/search_vulnerabilities and list/search_misconfigurations, "
     "each with get_*, *_notes and *_history.\n"
     "- Assets: list/search_inventory_items -> get_inventory_item.\n"
+    "- Containment: search_agents to find an agent id, then isolate_endpoint / "
+    "reconnect_endpoint to disconnect or restore its network access.\n"
     "- search_* take filters as a JSON string; datetime filters need epoch "
     "milliseconds from iso_to_unix_timestamp. Lists page with first + after "
     "(pageInfo.endCursor); ask for fields='[\"id\"]' while paging.\n"
